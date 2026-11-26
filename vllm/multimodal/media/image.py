@@ -10,6 +10,7 @@ import torch
 from PIL import Image
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.utils.serial_utils import numpy2tensor, tensor2base64
 from vllm.utils.sparse_utils import (
     check_sparse_tensor_invariants_threadsafe,
@@ -17,10 +18,14 @@ from vllm.utils.sparse_utils import (
     safe_to_dense,
 )
 
+from ..deepseek_v41_jpeg import DRAFT_INFO_KEY, VisionResizeConfig, draft_jpeg
 from ..image import convert_image_mode, normalize_image, open_image
 from .base import MediaDecodedBudget, MediaIO, MediaWithBytes
 
 MAGIC_NUMPY_PREFIX = b"\x93NUMPY"  # https://numpy.org/devdocs/reference/generated/numpy.lib.format.html#format-version-1-0
+
+
+logger = init_logger(__name__)
 
 
 class ImageMediaIO(MediaIO[Image.Image]):
@@ -49,6 +54,15 @@ class ImageMediaIO(MediaIO[Image.Image]):
         # media loaders (e.g. custom implementations)
         # for flexible control.
         self.kwargs = kwargs
+        draft_config = kwargs.get("deepseek_v41_jpeg_draft")
+        if draft_config is not None and not isinstance(draft_config, dict):
+            raise ValueError("deepseek_v41_jpeg_draft must be an object or null")
+        try:
+            self.draft_config = (
+                VisionResizeConfig(**draft_config) if draft_config is not None else None
+            )
+        except TypeError as exc:
+            raise ValueError(f"Invalid deepseek_v41_jpeg_draft config: {exc}") from exc
 
         # Extract RGBA background color from kwargs if provided
         # Default to white background for backward compatibility
@@ -92,6 +106,11 @@ class ImageMediaIO(MediaIO[Image.Image]):
                 )
             if self.decoded_budget is not None:
                 self.decoded_budget.charge(w * h * 4)
+            draft_info = (
+                draft_jpeg(image, self.draft_config)
+                if self.draft_config is not None
+                else None
+            )
             image = normalize_image(image)
             image.load()
             converted = self._convert_image_mode(image)
@@ -114,6 +133,15 @@ class ImageMediaIO(MediaIO[Image.Image]):
                 "image_mode": self.image_mode,
                 "rgba_background_color": self.rgba_background_color,
             }
+        if draft_info is not None:
+            converted.info[DRAFT_INFO_KEY] = draft_info
+            io_config = io_config or {}
+            io_config["deepseek_v41_jpeg_draft"] = draft_info["config"]
+            logger.debug(
+                "MM_JPEG_DRAFT original_wh=%s decoded_wh=%s",
+                draft_info["original_wh"],
+                converted.size,
+            )
         return MediaWithBytes(converted, data, io_config)
 
     def load_base64(self, media_type: str, data: str) -> MediaWithBytes[Image.Image]:

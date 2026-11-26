@@ -19,6 +19,7 @@ boundaries freely).
 
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from typing import Any
 
 import numpy as np
@@ -28,6 +29,13 @@ from transformers import BatchFeature
 
 from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.inputs import MultiModalDataDict
+from vllm.multimodal.deepseek_v41_jpeg import (
+    DRAFT_INFO_KEY,
+    VisionResizeConfig,
+    image_geometry,
+    num_image_tokens,
+    pad_draft_image,
+)
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import (
     DictEmbeddingItems,
@@ -81,56 +89,6 @@ def validate_image_sentinel_ids(tokenizer) -> None:
         )
 
 
-def llm_grid(best_height, best_width, patch_size, downsample_ratio):
-    """Token grid the aligner produces from a patch grid of this pixel size."""
-    return (
-        math.ceil((best_height // patch_size) / downsample_ratio),
-        math.ceil((best_width // patch_size) / downsample_ratio),
-    )
-
-
-def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
-    return n_llm_h * (n_llm_w + 1) + 2
-
-
-def solve_resize_ratio(height, width, patch_size, downsample_ratio, max_n_token):
-    """Largest aspect-preserving pixel size whose token grid still fits in
-    max_n_token. Returns (best_height, best_width)."""
-    r = height / width
-    max_w_float = math.sqrt((max_n_token - 2) / r + 0.25) - 0.5
-    max_h_float = max_w_float * r
-    cell = patch_size * downsample_ratio
-    if max_w_float < 1.0:  # very tall: collapse to a single column
-        return (max_n_token - 2) // 2 * cell, cell
-    if max_h_float < 1.0:  # very wide: collapse to a single row
-        return cell, (max_n_token - 3) * cell
-    beta = min(
-        math.floor(max_w_float) * cell / width,
-        math.floor(max_h_float) * cell / height,
-    )
-    return (
-        math.floor(height * beta / patch_size) * patch_size,
-        math.floor(width * beta / patch_size) * patch_size,
-    )
-
-
-def safe_resize(
-    height, width, best_height, best_width, patch_size, downsample_ratio, max_n_token
-):
-    """Shrink the pixel size until the image costs at most max_n_token LLM
-    tokens."""
-    n_llm_h, n_llm_w = llm_grid(best_height, best_width, patch_size, downsample_ratio)
-    if num_image_tokens(n_llm_h, n_llm_w) > max_n_token:
-        best_height, best_width = solve_resize_ratio(
-            height, width, patch_size, downsample_ratio, max_n_token
-        )
-        n_llm_h, n_llm_w = llm_grid(
-            best_height, best_width, patch_size, downsample_ratio
-        )
-        assert num_image_tokens(n_llm_h, n_llm_w) <= max_n_token
-    return n_llm_h, n_llm_w, best_height, best_width
-
-
 def load_image(
     image: Image.Image,
     *,
@@ -148,22 +106,26 @@ def load_image(
     decoded (vLLM supplies PIL images instead of a record dict).
     """
     p = patch_size
+    draft_info = image.info.get(DRAFT_INFO_KEY)
+    used_draft = isinstance(draft_info, dict)
+    original_wh = image.size
+    if used_draft:
+        expected_config = VisionResizeConfig(
+            patch_size, downsample_ratio, max_n_token, min_pixels, max_wh_ratio
+        )
+        if draft_info["config"] != asdict(expected_config):
+            raise ValueError("JPEG draft config does not match the DeepSeek V4.1 model")
+        original_wh = draft_info["original_wh"]
     image = image.convert("RGB")
-    width, height = image.size
-    if max_wh_ratio is not None and width > height * max_wh_ratio:
-        width = height * max_wh_ratio
-    if 0 < width * height < min_pixels:
-        ratio = (min_pixels / (width * height)) ** 0.5
-        width = int(width * ratio)
-        height = int(height * ratio)
-    best_width = math.ceil(width / p) * p
-    best_height = math.ceil(height / p) * p
-    n_llm_h, n_llm_w, best_height, best_width = safe_resize(
-        height, width, best_height, best_width, p, downsample_ratio, max_n_token
+    width, height = original_wh
+    n_llm_h, n_llm_w, best_height, best_width = image_geometry(
+        width, height, p, downsample_ratio, max_n_token, min_pixels, max_wh_ratio
     )
     n_vit_h, n_vit_w = best_height // p, best_width // p
-    if max_wh_ratio is not None and image.width >= max_wh_ratio * image.height:
+    if max_wh_ratio is not None and width >= max_wh_ratio * height:
         image = image.resize((best_width, best_height))
+    elif used_draft:
+        image = pad_draft_image(image, (best_width, best_height), original_wh)
     else:
         image = ImageOps.pad(image, (best_width, best_height), color=(127, 127, 127))
     assert do_rescale == do_normalize

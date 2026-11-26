@@ -1141,6 +1141,23 @@ vllm serve llava-hf/llava-1.5-7b-hf \
   --media-io-kwargs '{"image": {"rgba_background_color": [128, 128, 128]}}'
 ```
 
+#### Reduced JPEG decoding for DeepSeek V4.1
+
+DeepSeek V4.1 can decode large JPEGs at a lower resolution before resizing
+them to the model's target size. Enable this optional path with
+`deepseek_v41_jpeg_draft` under the `image` key in `--media-io-kwargs`.
+Set all five values to match the served model's `vision_config`.
+
+```bash
+vllm serve /path/to/deepseek-v4.1-vision \
+  --media-io-kwargs '{"image":{"deepseek_v41_jpeg_draft":{"patch_size":14,"downsample_ratio":3,"max_image_tokens":1024,"min_pixels":295936,"max_wh_ratio":null}}}'
+```
+
+Use this option for DeepSeek V4.1 image inputs. The default is full-resolution
+decoding. Reduced decoding applies to eligible RGB and grayscale JPEGs and
+preserves the final ViT grid and image token count. Pixel values can differ
+from those produced by full decoding followed by resizing.
+
 ### Audio Inputs
 
 Audio input is supported according to [OpenAI Audio API](https://platform.openai.com/docs/guides/audio?audio-generation-quickstart-example=audio-in).

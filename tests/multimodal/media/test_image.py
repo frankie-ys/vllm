@@ -11,6 +11,7 @@ import pytest
 from PIL import Image, features
 from PIL.BlpImagePlugin import BLPFormatError
 
+import vllm.envs as envs
 from vllm.multimodal.image import (
     ALLOWED_IMAGE_FORMATS,
     open_image,
@@ -21,6 +22,46 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets"
 assert ASSETS_DIR.exists()
+
+
+@pytest.mark.parametrize("orientation", [1, 6])
+def test_deepseek_v41_jpeg_draft_preserves_grid(orientation, monkeypatch):
+    from vllm.models.deepseek_v41.common.mm_preprocess import load_image
+    from vllm.multimodal.hasher import MultiModalHasher
+
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 1000000)
+    config = {
+        "patch_size": 14,
+        "downsample_ratio": 3,
+        "max_image_tokens": 20,
+        "min_pixels": 0,
+        "max_wh_ratio": None,
+    }
+    exif = Image.Exif()
+    exif[274] = orientation
+    buffer = BytesIO()
+    Image.new("RGB", (701, 545), (30, 60, 90)).save(buffer, "JPEG", exif=exif)
+    data = buffer.getvalue()
+    full = ImageMediaIO().load_bytes(data)
+    reduced_io = ImageMediaIO(deepseek_v41_jpeg_draft=config)
+    reduced = reduced_io.load_base64("image/jpeg", base64.b64encode(data).decode())
+    assert full.size == ((545, 701) if orientation == 6 else (701, 545))
+    assert all(a < b for a, b in zip(reduced.size, full.size))
+    assert MultiModalHasher.hash_kwargs("blake3", image=full) != (
+        MultiModalHasher.hash_kwargs("blake3", image=reduced)
+    )
+
+    processor_kwargs = dict(config)
+    processor_kwargs["max_n_token"] = processor_kwargs.pop("max_image_tokens")
+    _, *full_grid = load_image(full.media, **processor_kwargs)
+    _, *reduced_grid = load_image(reduced.media, **processor_kwargs)
+    assert full_grid == reduced_grid
+    with pytest.raises(ValueError, match="JPEG draft config does not match"):
+        load_image(reduced.media, **(processor_kwargs | {"max_n_token": 30}))
+
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100000)
+    with pytest.raises(ValueError, match="Image dimensions 701x545"):
+        reduced_io.load_bytes(data)
 
 
 def test_image_media_io_rgba_custom_background(tmp_path):
